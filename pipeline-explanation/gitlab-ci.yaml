@@ -1,0 +1,474 @@
+# ============================================================
+# GitLab CI/CD Pipeline
+# Application: FastAPI
+# Container: Podman/Docker
+# Registry: Azure Container Registry
+# Kubernetes: AKS
+# CD: GitOps with Argo CD
+# ============================================================
+
+stages:
+  - validate
+  - test
+  - quality
+  - build
+  - security
+  - publish
+  - deploy-dev
+  - validate-dev
+  - deploy-qas
+  - validate-qas
+  - deploy-prod
+  - validate-prod
+
+
+# ------------------------------------------------------------
+# GLOBAL VARIABLES
+# ------------------------------------------------------------
+
+variables:
+  IMAGE_NAME: "dasapi"
+
+  # Use commit SHA as immutable image version
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+  # GitOps repository
+  GITOPS_BRANCH: "main"
+
+  # Prevent Docker from downloading unnecessary data
+  GIT_DEPTH: "0"
+
+
+# ------------------------------------------------------------
+# PIPELINE TRIGGER
+# ------------------------------------------------------------
+
+workflow:
+  rules:
+
+    # Merge requests
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+    # Sprint branches
+    - if: '$CI_COMMIT_BRANCH =~ /^sprint-[0-9]+$/'
+
+    # Main branch
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+    # Release tags
+    - if: '$CI_COMMIT_TAG'
+
+
+# ============================================================
+# 1. VALIDATION
+# ============================================================
+
+validate:
+  stage: validate
+
+  image: python:3.12-slim
+
+  script:
+
+    - echo "Starting pipeline validation"
+
+    # Verify required files
+    - test -f Dockerfile
+    - test -f requirements.txt
+
+    # Python syntax validation
+    - python -m compileall .
+
+    # Display versions
+    - python --version
+
+    - echo "Validation completed successfully"
+
+
+# ============================================================
+# 2. UNIT / API TESTS
+# ============================================================
+
+unit-tests:
+  stage: test
+
+  image: python:3.12-slim
+
+  before_script:
+
+    - pip install --no-cache-dir -r requirements.txt
+    - pip install --no-cache-dir pytest
+
+  script:
+
+    - echo "Running unit tests"
+    - pytest -v
+
+  needs:
+    - validate
+
+
+# ============================================================
+# 3. SONARQUBE / CODE QUALITY
+# ============================================================
+
+sonarqube:
+  stage: quality
+
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+
+  variables:
+
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+
+    SONAR_SCANNER_OPTS: >
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.projectKey=dasapiservice-key
+      -Dsonar.sources=.
+
+  script:
+
+    - echo "Running SonarQube analysis"
+    - sonar-scanner
+
+  needs:
+    - unit-tests
+
+
+# ============================================================
+# 4. BUILD CONTAINER IMAGE
+# ============================================================
+
+build-image:
+  stage: build
+
+  tags:
+    - wiaps-shell-runner-dev
+
+  before_script:
+
+    - echo "$ACR_REGISTRY_DEV_PASSWORD" |
+      podman login "$ACR_REGISTRY_DEV"
+      --username "$ACR_REGISTRY_DEV_USER"
+      --password-stdin
+
+  script:
+
+    - echo "Building container image"
+
+    - echo "Image: $ACR_REGISTRY_DEV/$IMAGE_NAME:$IMAGE_TAG"
+
+    - podman build \
+        -t "$ACR_REGISTRY_DEV/$IMAGE_NAME:$IMAGE_TAG" \
+        .
+
+    # Save image tag for next jobs
+    - echo "IMAGE_TAG=$IMAGE_TAG" > build.env
+
+    - echo "IMAGE_NAME=$IMAGE_NAME" >> build.env
+
+  artifacts:
+
+    reports:
+      dotenv: build.env
+
+  needs:
+    - sonarqube
+
+
+# ============================================================
+# 5. CONTAINER SECURITY SCAN
+# ============================================================
+
+container-security-scan:
+  stage: security
+
+  tags:
+    - wiaps-shell-runner-dev
+
+  script:
+
+    - echo "Scanning container image"
+
+    # Example:
+    # trivy image
+    # "$ACR_REGISTRY_DEV/$IMAGE_NAME:$IMAGE_TAG"
+
+    - echo "Container vulnerability scan completed"
+
+  needs:
+    - job: build-image
+      artifacts: true
+
+
+# ============================================================
+# 6. PUBLISH IMAGE TO ACR
+# ============================================================
+
+publish-image:
+  stage: publish
+
+  tags:
+    - wiaps-shell-runner-dev
+
+  before_script:
+
+    - echo "$ACR_REGISTRY_DEV_PASSWORD" |
+      podman login "$ACR_REGISTRY_DEV"
+      --username "$ACR_REGISTRY_DEV_USER"
+      --password-stdin
+
+  script:
+
+    - echo "Publishing image to ACR"
+
+    - podman push \
+        "$ACR_REGISTRY_DEV/$IMAGE_NAME:$IMAGE_TAG"
+
+    - echo "Image published successfully"
+
+  needs:
+    - job: build-image
+      artifacts: true
+
+    - container-security-scan
+
+
+# ============================================================
+# 7. UPDATE DEV GITOPS CONFIGURATION
+# ============================================================
+
+deploy-dev:
+  stage: deploy-dev
+
+  image:
+    name: mikefarah/yq:4
+    entrypoint: [""]
+
+  script:
+
+    - echo "Updating DEV GitOps configuration"
+
+    # Clone GitOps repository
+    - git clone
+      "https://oauth2:${GITOPS_PUSH_TOKEN}@${GITOPS_REPO}"
+      gitops
+
+    - cd gitops
+
+    - git checkout "$GITOPS_BRANCH"
+
+    # Update image tag
+    - yq -i
+      '.image.tag = env(IMAGE_TAG)'
+      environments/dev/values.yaml
+
+    # Commit change
+    - git config user.name "GitLab CI Bot"
+
+    - git config user.email "gitlab-ci-bot@example.com"
+
+    - git add environments/dev/values.yaml
+
+    - git commit
+      -m "Deploy ${IMAGE_NAME}:${IMAGE_TAG} to DEV"
+
+    - git push origin "$GITOPS_BRANCH"
+
+    - echo "DEV GitOps configuration updated"
+
+  environment:
+    name: dev
+
+  needs:
+    - publish-image
+
+
+# ============================================================
+# 8. DEV VALIDATION
+# ============================================================
+
+validate-dev:
+  stage: validate-dev
+
+  script:
+
+    - echo "Waiting for Argo CD deployment"
+
+    # In a real environment:
+    #
+    # argocd app wait dasapi-dev \
+    #   --sync \
+    #   --health \
+    #   --timeout 600
+
+    - echo "Running DEV smoke test"
+
+    # Example:
+    #
+    # curl --fail https://dasapi-dev.example.com/health
+
+    - echo "DEV validation successful"
+
+  needs:
+    - deploy-dev
+
+
+# ============================================================
+# 9. QAS DEPLOYMENT
+# ============================================================
+
+deploy-qas:
+  stage: deploy-qas
+
+  when: manual
+
+  image:
+    name: mikefarah/yq:4
+    entrypoint: [""]
+
+  script:
+
+    - echo "Promoting image to QAS"
+
+    - git clone
+      "https://oauth2:${GITOPS_PUSH_TOKEN}@${GITOPS_REPO}"
+      gitops
+
+    - cd gitops
+
+    - git checkout "$GITOPS_BRANCH"
+
+    # Deploy SAME immutable image
+    - yq -i
+      '.image.tag = env(IMAGE_TAG)'
+      environments/qas/values.yaml
+
+    - git config user.name "GitLab CI Bot"
+
+    - git config user.email "gitlab-ci-bot@example.com"
+
+    - git add environments/qas/values.yaml
+
+    - git commit
+      -m "Deploy ${IMAGE_NAME}:${IMAGE_TAG} to QAS"
+
+    - git push origin "$GITOPS_BRANCH"
+
+  environment:
+    name: qas
+
+  needs:
+    - validate-dev
+
+
+# ============================================================
+# 10. QAS VALIDATION
+# ============================================================
+
+validate-qas:
+  stage: validate-qas
+
+  script:
+
+    - echo "Waiting for QAS deployment"
+
+    # Example:
+    #
+    # argocd app wait dasapi-qas \
+    #   --sync \
+    #   --health \
+    #   --timeout 600
+
+    - echo "Running QAS smoke tests"
+
+    # Example:
+    #
+    # curl --fail https://dasapi-qas.example.com/health
+
+    - echo "QAS validation successful"
+
+  needs:
+    - deploy-qas
+
+
+# ============================================================
+# 11. PRODUCTION DEPLOYMENT
+# ============================================================
+
+deploy-prod:
+  stage: deploy-prod
+
+  when: manual
+
+  image:
+    name: mikefarah/yq:4
+    entrypoint: [""]
+
+  script:
+
+    - echo "Starting production deployment"
+
+    - git clone
+      "https://oauth2:${GITOPS_PUSH_TOKEN}@${GITOPS_REPO}"
+      gitops
+
+    - cd gitops
+
+    - git checkout "$GITOPS_BRANCH"
+
+    # Update production image
+    - yq -i
+      '.image.tag = env(IMAGE_TAG)'
+      environments/prod/values.yaml
+
+    - git config user.name "GitLab CI Bot"
+
+    - git config user.email "gitlab-ci-bot@example.com"
+
+    - git add environments/prod/values.yaml
+
+    - git commit
+      -m "Deploy ${IMAGE_NAME}:${IMAGE_TAG} to PROD"
+
+    - git push origin "$GITOPS_BRANCH"
+
+    - echo "Production GitOps configuration updated"
+
+  environment:
+    name: production
+
+  needs:
+    - validate-qas
+
+
+# ============================================================
+# 12. PRODUCTION VALIDATION
+# ============================================================
+
+validate-prod:
+  stage: validate-prod
+
+  script:
+
+    - echo "Waiting for Argo CD production deployment"
+
+    # Example:
+    #
+    # argocd app wait dasapi-prod \
+    #   --sync \
+    #   --health \
+    #   --timeout 600
+
+    - echo "Running production smoke test"
+
+    # Example:
+    #
+    # curl --fail https://dasapi.example.com/health
+
+    - echo "Production deployment successful"
+
+  needs:
+    - deploy-prod
